@@ -20,7 +20,7 @@ CONFIG = {
     "MASTER_HYPER": "master_analytics.hyper",
     "TABLE_NAME": TableName("Extract", "Extract"),
     "RETENTION_DAYS": 180,
-    "CHUNK_SIZE": 200000 # Increased for production speed
+    "CHUNK_SIZE": 200000 
 }
 
 def publish_to_tableau():
@@ -37,14 +37,19 @@ def publish_to_tableau():
             return
 
         print(f"Publishing {CONFIG['MASTER_HYPER']}...")
+        # Overwrite the datasource
         server.datasources.publish(ds, CONFIG["MASTER_HYPER"], mode=TSC.Server.PublishMode.Overwrite)
-        print("Publish Complete.")
+        
+        # --- CHANGED: Force Dashboard Refresh ---
+        server.datasources.refresh(ds)
+        # ----------------------------------------
+        print("Publish and Refresh Triggered.")
 
 def run_pipeline(job_id, csv_url):
     raw_file = f"raw_{job_id}.csv"
+    temp_batch = f"temp_batch_{job_id}.csv"
     
     try:
-        # 1. Download
         print(f"Downloading: {csv_url[:50]}...")
         r = requests.get(csv_url, stream=True, timeout=900)
         r.raise_for_status()
@@ -52,16 +57,19 @@ def run_pipeline(job_id, csv_url):
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 f.write(chunk)
 
-        # 2. Hyper Processing
         master_exists = os.path.exists(CONFIG["MASTER_HYPER"])
         mode = CreateMode.CREATE_AND_REPLACE if not master_exists else CreateMode.NONE
 
         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
             with Connection(endpoint=hyper.endpoint, database=CONFIG["MASTER_HYPER"], create_mode=mode) as conn:
                 
-                table_created = master_exists
+                # --- CHANGED: Safe Schema and Table Check ---
+                if not conn.catalog.has_schema("Extract"):
+                    conn.catalog.create_schema("Extract")
                 
-                # Use chunking to handle 50M+ rows without memory crash
+                table_exists = conn.catalog.has_table(CONFIG["TABLE_NAME"])
+                # --------------------------------------------
+                
                 for chunk in pd.read_csv(raw_file, chunksize=CONFIG["CHUNK_SIZE"], low_memory=False):
                     
                     if "timestamp_derived" in chunk.columns:
@@ -72,38 +80,34 @@ def run_pipeline(job_id, csv_url):
                     if chunk.empty:
                         continue
 
-                    # Create Table Schema if it's a new file
-                    if not table_created:
+                    # --- CHANGED: Schema Creation logic moved inside chunk loop ---
+                    if not table_exists:
                         tdef = TableDefinition(table_name=CONFIG["TABLE_NAME"])
                         for col in chunk.columns:
                             tdef.add_column(col, SqlType.timestamp() if col == "timestamp_derived" else SqlType.text())
                         conn.catalog.create_table(tdef)
-                        table_created = True
+                        table_exists = True
+                    # -------------------------------------------------------------
 
-                    # Fast Bulk Load using temporary CSV
-                    temp_batch = f"temp_batch_{job_id}.csv"
                     chunk.to_csv(temp_batch, index=False)
-                    
                     conn.execute_command(
                         f"COPY {CONFIG['TABLE_NAME']} FROM {escape_string_literal(os.path.abspath(temp_batch))} "
                         f"WITH (format csv, header true)"
                     )
-                    os.remove(temp_batch)
+                    if os.path.exists(temp_batch): os.remove(temp_batch)
 
-                # 3. Rolling Retention Cleanup
                 print("Cleaning up data older than 180 days...")
                 cutoff_str = (datetime.now(timezone.utc) - timedelta(days=CONFIG["RETENTION_DAYS"])).strftime('%Y-%m-%d %H:%M:%S')
                 conn.execute_command(f"DELETE FROM {CONFIG['TABLE_NAME']} WHERE \"timestamp_derived\" < '{cutoff_str}'")
 
-        # 4. Final Publish
         publish_to_tableau()
 
     except Exception as e:
         print(f"Pipeline Error: {e}")
         sys.exit(1)
     finally:
-        if os.path.exists(raw_file):
-            os.remove(raw_file)
+        if os.path.exists(raw_file): os.remove(raw_file)
+        if os.path.exists(temp_batch): os.remove(temp_batch)
 
 if __name__ == "__main__":
     if len(sys.argv) > 2:
