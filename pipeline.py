@@ -37,12 +37,10 @@ def publish_to_tableau():
             return
 
         print(f"Publishing {CONFIG['MASTER_HYPER']}...")
-        # Overwrite the datasource
         server.datasources.publish(ds, CONFIG["MASTER_HYPER"], mode=TSC.Server.PublishMode.Overwrite)
         
-        # --- CHANGED: Force Dashboard Refresh ---
+        # Trigger refresh to update dashboards immediately
         server.datasources.refresh(ds)
-        # ----------------------------------------
         print("Publish and Refresh Triggered.")
 
 def run_pipeline(job_id, csv_url):
@@ -50,6 +48,7 @@ def run_pipeline(job_id, csv_url):
     temp_batch = f"temp_batch_{job_id}.csv"
     
     try:
+        # 1. Download CSV
         print(f"Downloading: {csv_url[:50]}...")
         r = requests.get(csv_url, stream=True, timeout=900)
         r.raise_for_status()
@@ -57,20 +56,18 @@ def run_pipeline(job_id, csv_url):
             for chunk in r.iter_content(chunk_size=1024 * 1024):
                 f.write(chunk)
 
+        # 2. Hyper Processing
         master_exists = os.path.exists(CONFIG["MASTER_HYPER"])
         mode = CreateMode.CREATE_AND_REPLACE if not master_exists else CreateMode.NONE
 
         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-            # --- REPLACE THIS SECTION ---
-                with Connection(endpoint=hyper.endpoint, database=CONFIG["MASTER_HYPER"], create_mode=mode) as conn:
-    
-    # Correct way to ensure schema exists safely
-                        conn.execute_command('CREATE SCHEMA IF NOT EXISTS "Extract"')
-    
-    # Standard Hyper API check for table existence
-                            table_exists = conn.catalog.has_table(CONFIG["TABLE_NAME"])
-# -----------------------------    
-                # --------------------------------------------
+            with Connection(endpoint=hyper.endpoint, database=CONFIG["MASTER_HYPER"], create_mode=mode) as conn:
+                
+                # FIXED: Schema handling via SQL command
+                conn.execute_command('CREATE SCHEMA IF NOT EXISTS "Extract"')
+                
+                # FIXED: Aligned indentation for table check
+                table_exists = conn.catalog.has_table(CONFIG["TABLE_NAME"])
                 
                 for chunk in pd.read_csv(raw_file, chunksize=CONFIG["CHUNK_SIZE"], low_memory=False):
                     
@@ -82,15 +79,15 @@ def run_pipeline(job_id, csv_url):
                     if chunk.empty:
                         continue
 
-                    # --- CHANGED: Schema Creation logic moved inside chunk loop ---
+                    # Table creation logic
                     if not table_exists:
                         tdef = TableDefinition(table_name=CONFIG["TABLE_NAME"])
                         for col in chunk.columns:
                             tdef.add_column(col, SqlType.timestamp() if col == "timestamp_derived" else SqlType.text())
                         conn.catalog.create_table(tdef)
                         table_exists = True
-                    # -------------------------------------------------------------
 
+                    # Fast Bulk Load
                     chunk.to_csv(temp_batch, index=False)
                     conn.execute_command(
                         f"COPY {CONFIG['TABLE_NAME']} FROM {escape_string_literal(os.path.abspath(temp_batch))} "
@@ -98,10 +95,12 @@ def run_pipeline(job_id, csv_url):
                     )
                     if os.path.exists(temp_batch): os.remove(temp_batch)
 
+                # 3. Rolling Retention Cleanup
                 print("Cleaning up data older than 180 days...")
                 cutoff_str = (datetime.now(timezone.utc) - timedelta(days=CONFIG["RETENTION_DAYS"])).strftime('%Y-%m-%d %H:%M:%S')
                 conn.execute_command(f"DELETE FROM {CONFIG['TABLE_NAME']} WHERE \"timestamp_derived\" < '{cutoff_str}'")
 
+        # 4. Final Publish
         publish_to_tableau()
 
     except Exception as e:
