@@ -61,13 +61,15 @@ def run_pipeline(job_id, csv_url):
         mode = CreateMode.CREATE_AND_REPLACE if not master_exists else CreateMode.NONE
 
         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
-            with Connection(endpoint=hyper.endpoint, database=CONFIG["MASTER_HYPER"], create_mode=mode) as conn:
-                
-                # --- CHANGED: Safe Schema and Table Check ---
-                if not conn.catalog.has_schema("Extract"):
-                    conn.catalog.create_schema("Extract")
-                
-                table_exists = conn.catalog.has_table(CONFIG["TABLE_NAME"])
+            # --- REPLACE THIS SECTION ---
+                with Connection(endpoint=hyper.endpoint, database=CONFIG["MASTER_HYPER"], create_mode=mode) as conn:
+    
+    # Correct way to ensure schema exists safely
+                        conn.execute_command('CREATE SCHEMA IF NOT EXISTS "Extract"')
+    
+    # Standard Hyper API check for table existence
+                            table_exists = conn.catalog.has_table(CONFIG["TABLE_NAME"])
+# -----------------------------    
                 # --------------------------------------------
                 
                 for chunk in pd.read_csv(raw_file, chunksize=CONFIG["CHUNK_SIZE"], low_memory=False):
