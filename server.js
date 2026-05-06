@@ -17,12 +17,11 @@ async function processQueue() {
     isProcessing = true;
 
     const { jobId, csvUrl } = queue.shift();
+    console.log(`[Queue] Starting Job: ${jobId}`);
     jobStatus[jobId].status = "RUNNING";
 
     const isWindows = os.platform() === 'win32';
-    // --- CHANGED: Safer path handling for Render/Linux ---
     const pythonPath = process.env.PYTHON_PATH || (isWindows ? 'python' : 'python3');
-    // -----------------------------------------------------
 
     const py = spawn(
         isWindows ? `"${pythonPath}"` : pythonPath,
@@ -31,11 +30,16 @@ async function processQueue() {
     );
 
     py.stdout.on('data', d => console.log(`[${jobId}] ${d}`));
-    py.stderr.on('data', d => console.error(`[${jobId}] ERROR: ${d}`));
+    py.stderr.on('data', d => {
+        console.error(`[${jobId}] ERROR: ${d}`);
+        jobStatus[jobId].error = d.toString();
+    });
 
     py.on('close', (code) => {
         jobStatus[jobId].status = code === 0 ? "SUCCESS" : "FAILED";
         jobStatus[jobId].end_time = new Date().toISOString();
+        console.log(`[Queue] Finished Job: ${jobId} with code ${code}`);
+        
         isProcessing = false;
         processQueue(); 
     });
@@ -50,7 +54,11 @@ app.post('/ingest', (req, res) => {
 
     urls.forEach(url => {
         const jobId = uuidv4().slice(0, 8);
-        jobStatus[jobId] = { status: "QUEUED", csvUrl: url, start_time: new Date().toISOString() };
+        jobStatus[jobId] = {
+            status: "QUEUED",
+            csvUrl: url,
+            start_time: new Date().toISOString()
+        };
         queue.push({ jobId, csvUrl: url });
         newJobIds.push(jobId);
     });
